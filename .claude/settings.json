@@ -1,0 +1,8 @@
+{
+  "allowedTools": [
+    "Edit",
+    "Bash(git commit:*)",
+    "Bash(npm run build)",
+    "MCP(my_mcp_tool:*)"
+  ]
+}
