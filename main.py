@@ -47,8 +47,12 @@ def main():
     # Get database path
     db_path = os.getenv('DATABASE_PATH', './bot_data.db')
     
+    # Get webhook port and mode
+    webhook_port = int(os.getenv('WEBHOOK_PORT', '5000'))
+    use_polling = os.getenv('USE_POLLING', 'true').lower() == 'true'
+    
     # Create and start bot
-    bot = TelegramBot(bot_token, db_path)
+    bot = TelegramBot(bot_token, db_path, webhook_port, use_polling)
     
     try:
         logging.info("Starting Starknet Token Alert Bot...")

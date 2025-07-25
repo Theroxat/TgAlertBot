@@ -13,7 +13,10 @@ This is a Python-based Telegram bot that monitors Starknet token purchases and s
 pip install -r requirements.txt
 
 # Set up environment variables (see Configuration section)
-# Then start the bot
+# Test the bot connection
+python test_bot.py
+
+# Start the bot (HTTP webhook mode)
 python main.py
 
 # For debugging
@@ -28,6 +31,23 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 DATABASE_PATH=./bot_data.db
 LOG_LEVEL=INFO
 MONITORING_INTERVAL=15
+WEBHOOK_PORT=5000
+```
+
+### Webhook Configuration
+
+The bot now uses HTTP webhooks instead of polling. To configure the webhook:
+
+```bash
+# Set webhook URL (replace with your domain)
+curl -X POST https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook \
+     -H 'Content-Type: application/json' \
+     -d '{"url": "https://your-domain.com/webhook"}'
+
+# Or for local testing with ngrok:
+# 1. Install ngrok: https://ngrok.com/
+# 2. Start ngrok: ngrok http 5000
+# 3. Use the ngrok URL for webhook
 ```
 
 ## Architecture
@@ -37,9 +57,10 @@ The codebase follows a modular architecture with these core components:
 ### Core Modules
 
 - **main.py**: Entry point that loads environment variables, sets up logging, and starts the bot
-- **telegram_bot.py**: Main bot logic handling Telegram interactions, conversation flows, and message formatting
+- **telegram_bot.py**: Main bot logic using HTTP API directly with Flask webhook server for Telegram interactions
 - **starknet_monitor.py**: Blockchain monitoring service that fetches token data from DexScreener API
 - **database.py**: SQLite database wrapper managing group configurations, transaction tracking, and admin permissions
+- **test_bot.py**: Testing script to verify HTTP API connectivity and functionality
 
 ### Database Schema
 
@@ -65,18 +86,19 @@ The bot uses a simple fast setup approach:
 ## External APIs
 
 - **DexScreener API**: Primary data source for token prices and transaction data
-- **Telegram Bot API**: Message sending and group management
+- **Telegram Bot HTTP API**: Direct HTTP requests for message sending and group management (using curl/requests instead of python-telegram-bot library)
 
 ## File Structure
 
 ```
 AlertBot/
 ├── main.py              # Application entry point
-├── telegram_bot.py      # Telegram bot logic and handlers
+├── telegram_bot.py      # Telegram bot logic with HTTP API and Flask webhook
 ├── starknet_monitor.py  # Blockchain monitoring
 ├── database.py          # SQLite database management
-├── requirements.txt     # Python dependencies
-├── bot_config.json      # Runtime configuration storage
+├── test_bot.py          # HTTP API testing script
+├── requirements.txt     # Python dependencies (Flask + requests)
+├── .env                 # Environment variables (token, etc.)
 ├── bot_data.db          # SQLite database file
 └── bot.log             # Application logs
 ```
@@ -84,10 +106,25 @@ AlertBot/
 ## Development Notes
 
 - The bot supports multi-group operation with independent configurations per group
-- Uses async/await pattern for API calls and database operations
+- **NEW**: Uses HTTP API directly with requests library instead of python-telegram-bot
+- **NEW**: Flask webhook server for receiving Telegram updates
+- Uses async/await pattern for blockchain monitoring (with sync HTTP calls for Telegram)
 - Simple single-command setup without conversation state management
 - Includes error handling and automatic retry mechanisms
 - Features customizable alert thresholds and formatting
+
+## HTTP API Implementation
+
+The bot now uses direct HTTP calls to the Telegram Bot API:
+
+```python
+# Example: Send message
+response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                        json={'chat_id': chat_id, 'text': message})
+
+# Example: Get bot info  
+response = requests.get(f"https://api.telegram.org/bot{token}/getMe")
+```
 
 ## Fast Setup Example
 

@@ -1,57 +1,192 @@
 import logging
 import asyncio
-from typing import Dict
-
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.constants import ParseMode
+import json
+import requests
+from typing import Dict, Optional
+from flask import Flask, request, jsonify
+import threading
+import time
 
 from database import Database
 from starknet_monitor import StarknetMonitor
 
 
 class TelegramBot:
-    def __init__(self, token: str, db_path: str = "./bot_data.db"):
+    def __init__(self, token: str, db_path: str = "./bot_data.db", webhook_port: int = 5000, use_polling: bool = True):
         self.token = token
+        self.base_url = f"https://api.telegram.org/bot{token}"
         self.db = Database(db_path)
-        self.application = None
+        self.webhook_port = webhook_port
+        self.use_polling = use_polling
+        self.running = True
+        self.last_update_id = 0
+        
+        if not use_polling:
+            self.app = Flask(__name__)
+            self.setup_webhook_routes()
+        
         self.monitor = None
+    
+    def setup_webhook_routes(self):
+        """Setup Flask routes for webhook"""
+        @self.app.route('/webhook', methods=['POST'])
+        def webhook():
+            update = request.get_json()
+            self.handle_update(update)
+            return jsonify({'status': 'ok'})
+    
+    def send_message(self, chat_id: int, text: str, parse_mode: Optional[str] = None):
+        """Send message using HTTP API"""
+        url = f"{self.base_url}/sendMessage"
+        data = {
+            'chat_id': chat_id,
+            'text': text
+        }
+        if parse_mode:
+            data['parse_mode'] = parse_mode
+        
+        try:
+            response = requests.post(url, json=data)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error sending message: {e}")
+            return None
+    
+    def get_me(self):
+        """Get bot info using HTTP API"""
+        url = f"{self.base_url}/getMe"
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            return response.json()['result']
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error getting bot info: {e}")
+            return None
+    
+    def get_chat_member(self, chat_id: int, user_id: int):
+        """Get chat member info using HTTP API"""
+        url = f"{self.base_url}/getChatMember"
+        data = {
+            'chat_id': chat_id,
+            'user_id': user_id
+        }
+        try:
+            response = requests.post(url, json=data)
+            response.raise_for_status()
+            return response.json()['result']
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error getting chat member: {e}")
+            return None
+    
+    def handle_update(self, update: dict):
+        """Handle incoming update from webhook"""
+        try:
+            if 'message' in update:
+                message = update['message']
+                chat = message['chat']
+                user = message['from']
+                text = message.get('text', '')
+                
+                chat_id = chat['id']
+                user_id = user['id']
+                
+                # Handle new chat members
+                if 'new_chat_members' in message:
+                    self.new_member_handler(chat_id, user_id, text, message)
+                    return
+                
+                # Handle commands
+                if text.startswith('/'):
+                    command = text.split()[0][1:]  # Remove the '/'
+                    
+                    if command == 'start':
+                        self.start_command(chat_id, user_id, text, message)
+                    elif command == 'help':
+                        self.help_command(chat_id, user_id, text, message)
+                    elif command == 'setup':
+                        self.fast_setup_command(chat_id, user_id, text, message)
+                    elif command == 'status':
+                        self.status_command(chat_id, user_id, text, message)
+                    elif command == 'pause':
+                        self.pause_command(chat_id, user_id, text, message)
+                    elif command == 'resume':
+                        self.resume_command(chat_id, user_id, text, message)
+                    elif command == 'edit':
+                        self.edit_command(chat_id, user_id, text, message)
+        
+        except Exception as e:
+            logging.error(f"Error handling update: {e}")
+    
+    def get_updates(self, offset=None, timeout=30):
+        """Get updates using HTTP API polling"""
+        url = f"{self.base_url}/getUpdates"
+        params = {
+            'timeout': timeout
+        }
+        if offset:
+            params['offset'] = offset
+        
+        try:
+            response = requests.get(url, params=params, timeout=timeout + 5)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error getting updates: {e}")
+            return {'ok': False, 'result': []}
+    
+    def start_polling(self):
+        """Start polling for updates"""
+        logging.info("Starting polling mode...")
+        
+        while self.running:
+            try:
+                # Get updates from Telegram
+                result = self.get_updates(offset=self.last_update_id + 1 if self.last_update_id > 0 else None)
+                
+                if result.get('ok') and result.get('result'):
+                    updates = result['result']
+                    
+                    for update in updates:
+                        # Update offset
+                        self.last_update_id = max(self.last_update_id, update['update_id'])
+                        
+                        # Handle the update
+                        self.handle_update(update)
+                
+                time.sleep(1)  # Small delay between requests
+                
+            except KeyboardInterrupt:
+                logging.info("Received shutdown signal")
+                self.running = False
+                break
+            except Exception as e:
+                logging.error(f"Error in polling loop: {e}")
+                time.sleep(5)  # Wait before retrying
         
     def start_bot(self):
         """Initialize and start the bot"""
-        self.application = Application.builder().token(self.token).build()
-        
-        # Add command handlers
-        handlers = [
-            CommandHandler('start', self.start_command),
-            CommandHandler('help', self.help_command),
-            CommandHandler('setup', self.fast_setup_command),
-            CommandHandler('status', self.status_command),
-            CommandHandler('pause', self.pause_command),
-            CommandHandler('resume', self.resume_command),
-            CommandHandler('edit', self.edit_command),
-        ]
-        
-        for handler in handlers:
-            self.application.add_handler(handler)
-        
-        # Specific message handlers
-        self.application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.new_member_handler))
-        
         logging.info("Bot started successfully!")
         
-        # Add post_init hook to start monitoring after bot is running
-        self.application.post_init = self._post_init_hook
+        # Start monitoring in a separate thread
+        monitoring_thread = threading.Thread(target=self._start_monitoring_thread, daemon=True)
+        monitoring_thread.start()
         
-        # Run the bot using the standard method
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        if self.use_polling:
+            # Start polling mode
+            self.start_polling()
+        else:
+            # Start Flask webhook server
+            self.app.run(host='0.0.0.0', port=self.webhook_port, debug=False)
     
-    async def _post_init_hook(self, application):
-        """Hook called after the application starts"""
+    def _start_monitoring_thread(self):
+        """Start monitoring in a separate thread"""
         logging.info("Starting monitoring in background...")
-        application.create_task(self.start_monitoring())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self.start_monitoring())
         
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def start_command(self, chat_id: int, user_id: int, text: str, message: dict):
         """Handle /start command"""
         welcome_message = """
 🤖 **Starknet Token Alert Bot**
@@ -71,9 +206,9 @@ Welcome! I help you monitor token purchases on Starknet and send stylized alerts
 **Example:**
 `/setup 0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7 ETH Ekubo 1000000 50`
         """
-        await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
+        self.send_message(chat_id, welcome_message, parse_mode='Markdown')
     
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def help_command(self, chat_id: int, user_id: int, text: str, message: dict):
         """Handle /help command"""
         help_message = """🤖 Bot de Surveillance Starknet - Aide
 
@@ -98,14 +233,14 @@ Welcome! I help you monitor token purchases on Starknet and send stylized alerts
 • SEUIL : Montant minimum d'achat en USD (0 = tous les achats)
 
 ℹ️ Le bot surveille les achats en temps réel et envoie des alertes stylisées dans ce groupe pour chaque transaction qui dépasse votre seuil configuré."""
-        await update.message.reply_text(help_message)
+        self.send_message(chat_id, help_message)
     
-    async def new_member_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def new_member_handler(self, chat_id: int, user_id: int, text: str, message: dict):
         """Handle bot being added to a new group"""
-        new_members = update.message.new_chat_members
-        bot_user = await context.bot.get_me()
+        new_members = message.get('new_chat_members', [])
+        bot_user = self.get_me()
         
-        if any(member.id == bot_user.id for member in new_members):
+        if bot_user and any(member.get('id') == bot_user['id'] for member in new_members):
             welcome_message = """🎉 Salut ! Merci de m'avoir ajouté à votre groupe !
 
 Je suis un bot de surveillance de tokens Starknet qui vous aide à :
@@ -121,16 +256,15 @@ Exemple :
 /setup 0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7 ETH Ekubo 1000000 50
 
 Tapez /help pour voir toutes les commandes disponibles !"""
-            await update.message.reply_text(welcome_message)
+            self.send_message(chat_id, welcome_message)
     
     
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def status_command(self, chat_id: int, user_id: int, text: str, message: dict):
         """Show current group configuration"""
-        chat_id = update.effective_chat.id
         config = self.db.get_group_config(chat_id)
         
         if not config:
-            await update.message.reply_text("❌ No configuration found. Use `/setup` to configure monitoring.")
+            self.send_message(chat_id, "❌ No configuration found. Use `/setup` to configure monitoring.")
             return
         
         status_icon = "✅" if config['is_active'] else "⏸️"
@@ -150,50 +284,46 @@ Use `/pause` or `/resume` to control alerts.
 Use `/edit` to modify configuration.
         """
         
-        await update.message.reply_text(status_message, parse_mode=ParseMode.MARKDOWN)
+        self.send_message(chat_id, status_message, parse_mode='Markdown')
     
-    async def pause_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def pause_command(self, chat_id: int, user_id: int, text: str, message: dict):
         """Pause alerts for this group"""
-        chat_id = update.effective_chat.id
-        
         if self.db.toggle_group_active(chat_id, False):
-            await update.message.reply_text("⏸️ Alerts paused for this group.")
+            self.send_message(chat_id, "⏸️ Alerts paused for this group.")
         else:
-            await update.message.reply_text("❌ No configuration found or error occurred.")
+            self.send_message(chat_id, "❌ No configuration found or error occurred.")
     
-    async def resume_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def resume_command(self, chat_id: int, user_id: int, text: str, message: dict):
         """Resume alerts for this group"""
-        chat_id = update.effective_chat.id
-        
         if self.db.toggle_group_active(chat_id, True):
-            await update.message.reply_text("▶️ Alerts resumed for this group!")
+            self.send_message(chat_id, "▶️ Alerts resumed for this group!")
         else:
-            await update.message.reply_text("❌ No configuration found or error occurred.")
+            self.send_message(chat_id, "❌ No configuration found or error occurred.")
     
-    async def edit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def edit_command(self, chat_id: int, user_id: int, text: str, message: dict):
         """Edit configuration (restart setup)"""
-        await update.message.reply_text(
+        self.send_message(
+            chat_id,
             "🔧 To edit your configuration, please run `/setup` again.\n\n"
             "**Format:** `/setup TOKEN_ADDRESS SYMBOL DEX SUPPLY THRESHOLD`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode='Markdown'
         )
     
-    async def fast_setup_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def fast_setup_command(self, chat_id: int, user_id: int, text: str, message: dict):
         """Fast setup command - all parameters in one line"""
-        chat_id = update.effective_chat.id
-        user_id = update.effective_user.id
-        
         # Check admin status for groups
-        if update.effective_chat.type in ['group', 'supergroup']:
-            chat_member = await context.bot.get_chat_member(chat_id, user_id)
-            if chat_member.status not in ['creator', 'administrator']:
-                await update.message.reply_text("❌ Only group admins can setup the bot.")
+        chat = message['chat']
+        if chat['type'] in ['group', 'supergroup']:
+            chat_member = self.get_chat_member(chat_id, user_id)
+            if chat_member and chat_member['status'] not in ['creator', 'administrator']:
+                self.send_message(chat_id, "❌ Only group admins can setup the bot.")
                 return
         
         # Parse arguments
-        args = context.args
+        args = text.split()[1:]  # Remove command itself
         if len(args) < 5:
-            await update.message.reply_text(
+            self.send_message(
+                chat_id,
                 "❌ Fast Setup Usage:\n"
                 "/setup TOKEN_ADDRESS SYMBOL DEX SUPPLY THRESHOLD\n\n"
                 "Parameters:\n"
@@ -226,7 +356,7 @@ Use `/edit` to modify configuration.
                 raise ValueError("Threshold must be 0 or higher")
                 
         except ValueError as e:
-            await update.message.reply_text(f"❌ **Error:** {str(e)}\n\nPlease check your inputs and try again.")
+            self.send_message(chat_id, f"❌ **Error:** {str(e)}\n\nPlease check your inputs and try again.")
             return
         
         # Create config
@@ -262,12 +392,12 @@ I'll start monitoring purchases and send alerts here! 🚀
 • `/resume` - Resume alerts
 • `/setup` - Change config
             """
-            await update.message.reply_text(success_message, parse_mode=ParseMode.MARKDOWN)
+            self.send_message(chat_id, success_message, parse_mode='Markdown')
         else:
-            await update.message.reply_text("❌ Error saving configuration. Please try again.")
+            self.send_message(chat_id, "❌ Error saving configuration. Please try again.")
     
     
-    async def send_buy_alert(self, chat_id: int, metrics: Dict):
+    def send_buy_alert(self, chat_id: int, metrics: Dict):
         """Send a formatted buy alert to the group"""
         try:
             # Check if transaction was already processed
@@ -291,10 +421,10 @@ I'll start monitoring purchases and send alerts here! 🚀
 🗡🗡🗡🗡🗡🗡🗡🗡
             """
             
-            await self.application.bot.send_message(
+            self.send_message(
                 chat_id=chat_id,
                 text=alert_message,
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode='Markdown'
             )
             
             # Mark transaction as processed
@@ -322,9 +452,13 @@ I'll start monitoring purchases and send alerts here! 🚀
                     
                     if active_groups:
                         # Monitor tokens and send alerts
+                        # Créer un wrapper async pour send_buy_alert
+                        async def async_send_alert(chat_id, metrics):
+                            self.send_buy_alert(chat_id, metrics)
+                        
                         await monitor.monitor_token_purchases(
                             active_groups, 
-                            self.send_buy_alert
+                            async_send_alert
                         )
                     else:
                         # No active groups, wait a bit longer
@@ -336,9 +470,7 @@ I'll start monitoring purchases and send alerts here! 🚀
                     await asyncio.sleep(30)
     
     
-    async def stop_bot(self):
+    def stop_bot(self):
         """Stop the bot gracefully"""
-        if self.application:
-            await self.application.stop()
-            await self.application.shutdown()
+        self.running = False
         logging.info("Bot stopped")
